@@ -1,977 +1,943 @@
 using GLMakie, GeometryBasics
-using Random, Printf
+using LinearAlgebra, Random, Printf
 
-const W = 1440f0
-const H = 900f0
-const FIXED_DT = 1 / 300 # fixed physics step
+const P2 = Point2f
+const V2 = Vec2f
+const Rect2 = GeometryBasics.Rect{2,Float32}
 
-# --- Theme colors (Nord‑inspired) ---
-const COLOR_BG     = RGBAf(0.18, 0.20, 0.25, 1.0)   # #2E3440
-const COLOR_TEXT   = RGBAf(0.90, 0.93, 0.97, 1.0)   # #E5E9F0
-const COLOR_PADDLE = RGBAf(0.53, 0.75, 0.82, 1.0)   # #88C0D0
-const COLOR_BALL   = RGBAf(0.93, 0.94, 0.96, 1.0)   # #ECEFF4
-const COLOR_BRICK1 = RGBAf(0.51, 0.63, 0.76, 1.0)   # #81A1C1
-const COLOR_BRICK2 = RGBAf(0.75, 0.38, 0.42, 1.0)   # #BF616A
-const COLOR_BRICK3 = RGBAf(0.92, 0.80, 0.55, 1.0)   # #EBCB8B
-const COLOR_STROKE = RGBAf(0.0, 0.0, 0.0, 0.45)
-const COLOR_HUDBG  = RGBAf(0.0, 0.0, 0.0, 0.35)
+const COLOR_BG = RGBAf(0.18, 0.20, 0.25, 1.0)
+const COLOR_TEXT = RGBAf(0.90, 0.93, 0.97, 1.0)
+const COLOR_PADDLE = RGBAf(0.53, 0.75, 0.82, 1.0)
+const COLOR_BALL = RGBAf(0.93, 0.94, 0.96, 1.0)
+const COLOR_BRICK1 = RGBAf(0.51, 0.63, 0.76, 1.0)
+const COLOR_BRICK2 = RGBAf(0.75, 0.38, 0.42, 1.0)
+const COLOR_BRICK3 = RGBAf(0.92, 0.80, 0.55, 1.0)
+const COLOR_HUDBG = RGBAf(0.0, 0.0, 0.0, 0.35)
+const COLOR_PU_PIERCE = RGBAf(0.98, 0.74, 0.26, 1.0)
+const COLOR_PU_MULTIBALL = RGBAf(0.45, 0.80, 0.75, 1.0)
+const COLOR_PU_LASER = RGBAf(0.94, 0.48, 0.35, 1.0)
+const COLOR_LASER_SHOT = RGBAf(0.99, 0.86, 0.40, 1.0)
+const HINT_FONT_SIZE = 26
+const HINT_LINE_HEIGHT = 2.0f0
 
-# Power‑up visuals
-const COLOR_PU_PIERCE   = RGBAf(0.98, 0.74, 0.26, 1.0)  # amber
-const COLOR_PU_MULTIBAL = RGBAf(0.45, 0.80, 0.75, 1.0)  # teal
-const COLOR_PU_LASER    = RGBAf(0.94, 0.48, 0.35, 1.0)  # orange‑red
-const COLOR_LASER_SHOT  = RGBAf(0.99, 0.86, 0.40, 1.0)
+@enum PowerupKind Pierce Multiball Laser
 
-const TRAIL_LEN    = 12
-const FLASH_MAX    = 0.18f0
-const COMBO_WINDOW = 3.0f0
-
-# Power‑up tuning
-const DROP_P      = 0.16f0                   # drop probability per destroyed brick
-const DROP_BUDGET = 10                        # max drops per level
-const PIERCE_DUR  = 6.0f0
-const LASER_DUR   = 10.0f0
-const SHOT_COOLD  = 0.7f0                     # ~1.4 shots/s while active
-const SHOT_SPEED  = 700f0
-const SHOT_TTL    = 1.2f0
-const CHILD_TTL   = Inf32            # child balls do not expire by time
-const MULTI_COUNT = 2                          # spawn +2 child balls
-
-mutable struct FXState
-    ppos::Vector{Point2f}
-    pvel::Vector{Vec2f}
-    pttl::Vector{Float32}
-    ptmax::Vector{Float32}
-    pcol::Vector{RGBAf}
-    bflash::Vector{Float32}
+@kwdef struct WorldConfig
+    width::Float32 = 1200f0
+    height::Float32 = 900f0
+    fixed_dt::Float32 = 1f0 / 300f0
 end
 
-# Minimal power‑up runtime state (kept small and cache‑friendly)
-mutable struct PUState
-    # falling items
-    item_pos::Vector{Point2f}
-    item_vel::Vector{Vec2f}
-    item_typ::Vector{Symbol}
-    # child balls
-    ball_pos::Vector{Point2f}
-    ball_vel::Vector{Vec2f}
-    ball_ttl::Vector{Float32}
-    # laser shots
-    shot_pos::Vector{Point2f}
-    shot_vel::Vector{Vec2f}
-    shot_ttl::Vector{Float32}
-    # timers
+@kwdef struct PaddleConfig
+    width_at_800::Float32 = 100f0
+    height_at_800::Float32 = 14f0
+    y_at_600::Float32 = 40f0
+    speed_at_800::Float32 = 480f0
+end
+
+@kwdef struct BallConfig
+    radius_at_800::Float32 = 8f0
+    initial_velocity_at_800::Vec2f = V2(176f0, 264f0)
+    max_speed::Float32 = 600f0
+    level_speed_growth::Float32 = 1.1f0
+    min_bounce_degrees::Float32 = 25f0
+    max_bounce_degrees::Float32 = 70f0
+    trail_length::Int = 12
+end
+
+@kwdef struct LevelConfig
+    cols::Int = 12
+    rows::Int = 7
+    margin::Float32 = 36f0
+    gutter::Float32 = 12f0
+    field_height_fraction::Float32 = 0.50f0
+    hud_gap::Float32 = 48f0
+    manual_min::Int = 1
+    manual_max::Int = 5
+    min_bricks::Int = 14
+    random_hole_probability::Float32 = 0.06f0
+end
+
+@kwdef struct PowerupConfig
+    drop_probability::Float32 = 0.16f0
+    drops_per_level::Int = 10
+    pierce_duration::Float32 = 6f0
+    laser_duration::Float32 = 10f0
+    shot_cooldown::Float32 = 0.7f0
+    shot_speed::Float32 = 700f0
+    shot_ttl::Float32 = 1.2f0
+    shot_hit_radius_at_800::Float32 = 3f0
+    multiball_count::Int = 2
+    multiball_arc_radians::Float32 = 0.50f0
+    child_ttl::Float32 = Inf32
+    item_start_speed::Float32 = -40f0
+    item_gravity::Float32 = 220f0
+    item_damping::Float32 = 0.995f0
+    item_marker_size_at_800::Float32 = 14f0
+    item_pickup_radius_factor::Float32 = 0.67f0
+    weights::NTuple{3,Float32} = (0.40f0, 0.35f0, 0.25f0)
+end
+
+@kwdef struct FxConfig
+    flash_duration::Float32 = 0.18f0
+    damaged_particles::Int = 12
+    destroyed_particles::Int = 28
+    damaged_ttl_range::Tuple{Float32,Float32} = (0.25f0, 0.50f0)
+    destroyed_ttl_range::Tuple{Float32,Float32} = (0.45f0, 0.80f0)
+    damaged_speed_range_at_800::Tuple{Float32,Float32} = (90f0, 210f0)
+    destroyed_speed_range_at_800::Tuple{Float32,Float32} = (120f0, 280f0)
+    particle_gravity::Float32 = 200f0
+    particle_damping::Float32 = 0.99f0
+end
+
+@kwdef struct ScoreConfig
+    damaged_brick::Int = 50
+    destroyed_brick::Int = 100
+    combo_step::Float32 = 0.1f0
+    combo_cap::Int = 10
+end
+
+@kwdef struct GameConfig
+    world::WorldConfig = WorldConfig()
+    paddle::PaddleConfig = PaddleConfig()
+    ball::BallConfig = BallConfig()
+    level::LevelConfig = LevelConfig()
+    powerup::PowerupConfig = PowerupConfig()
+    fx::FxConfig = FxConfig()
+    score::ScoreConfig = ScoreConfig()
+    starting_lives::Int = 3
+end
+
+mutable struct Paddle
+    x::Float32
+    y::Float32
+    w::Float32
+    h::Float32
+    speed::Float32
+end
+
+mutable struct Ball
+    pos::Point2f
+    vel::Vec2f
+    ttl::Float32
+end
+
+mutable struct BallState
+    main::Ball
+    extras::Vector{Ball}
+    launched::Bool
+    trail::Vector{Point2f}
+end
+
+mutable struct Brick
+    rect::Rect2
+    hp::Int
+    color::RGBAf
+    flash::Float32
+end
+
+mutable struct LevelState
+    index::Int
+    bricks::Vector{Brick}
+end
+
+mutable struct PowerupItem
+    pos::Point2f
+    vel::Vec2f
+    kind::PowerupKind
+end
+
+mutable struct LaserShot
+    pos::Point2f
+    vel::Vec2f
+    ttl::Float32
+end
+
+mutable struct PowerupState
+    items::Vector{PowerupItem}
+    shots::Vector{LaserShot}
     pierce_ttl::Float32
     laser_ttl::Float32
     next_shot::Float32
-    # per‑level drop counter
     drops_left::Int
 end
 
-# ---- Utils ----
-const P2 = Point2f
-const V2 = Vec2f
-rectf(x::Real, y::Real, w::Real, h::Real) = GeometryBasics.Rect(P2(Float32(x), Float32(y)), V2(Float32(w), Float32(h)))
-
-function rect_bounds(r::GeometryBasics.Rect{2,T}) where {T}
-    o = r.origin
-    s = r.widths
-    x1 = Float32(o[1])
-    y1 = Float32(o[2])
-    x2 = x1 + Float32(s[1])
-    y2 = y1 + Float32(s[2])
-    return x1, y1, x2, y2
+mutable struct Particle
+    pos::Point2f
+    vel::Vec2f
+    ttl::Float32
+    ttl_max::Float32
+    color::RGBAf
 end
 
-hp_color(h::Int) = h ≤ 1 ? COLOR_BRICK1 : (h == 2 ? COLOR_BRICK2 : COLOR_BRICK3)
+mutable struct FxState
+    particles::Vector{Particle}
+end
+
+mutable struct ComboState
+    count::Int
+end
+
+mutable struct Game
+    cfg::GameConfig
+    rng::MersenneTwister
+    paddle::Paddle
+    balls::BallState
+    level::LevelState
+    powerups::PowerupState
+    fx::FxState
+    combo::ComboState
+    score::Int
+    lives::Int
+    paused::Bool
+end
+
+mutable struct View
+    bricks::Observable{Vector{Rect2}}
+    brick_colors::Observable{Vector{RGBAf}}
+    paddle::Observable{Rect2}
+    balls::Observable{Vector{Point2f}}
+    ball_colors::Observable{Vector{RGBAf}}
+    trail_points::Observable{Vector{Point2f}}
+    trail_colors::Observable{Vector{RGBAf}}
+    items::Observable{Vector{Point2f}}
+    item_colors::Observable{Vector{RGBAf}}
+    shots::Observable{Vector{Point2f}}
+    particles::Observable{Vector{Point2f}}
+    particle_colors::Observable{Vector{RGBAf}}
+    score_text::Observable{String}
+    lives_text::Observable{String}
+    level_text::Observable{String}
+    pierce_text::Observable{String}
+    laser_text::Observable{String}
+    combo_text::Observable{String}
+    combo_color::Observable{RGBAf}
+    hint_bg::Observable{Vector{Rect2}}
+    hint_text::Observable{String}
+end
+
+scale_x(cfg::GameConfig) = cfg.world.width / 800f0
+scale_y(cfg::GameConfig) = cfg.world.height / 600f0
+rectf(x::Real, y::Real, w::Real, h::Real) = Rect2(P2(Float32(x), Float32(y)), V2(Float32(w), Float32(h)))
+rect_bounds(r::Rect2) = (r.origin[1], r.origin[2], r.origin[1] + r.widths[1], r.origin[2] + r.widths[2])
+hp_color(hp::Int) = hp <= 1 ? COLOR_BRICK1 : (hp == 2 ? COLOR_BRICK2 : COLOR_BRICK3)
+powerup_color(kind::PowerupKind) = kind == Pierce ? COLOR_PU_PIERCE : (kind == Multiball ? COLOR_PU_MULTIBALL : COLOR_PU_LASER)
 
 @inline function mix_rgba(a::RGBAf, b::RGBAf, t::Float32)
-    tt = clamp(t, 0f0, 1f0)
+    u = clamp(t, 0f0, 1f0)
     return RGBAf(
-        a.r + (b.r - a.r) * tt,
-        a.g + (b.g - a.g) * tt,
-        a.b + (b.b - a.b) * tt,
-        a.alpha + (b.alpha - a.alpha) * tt,
+        a.r + (b.r - a.r) * u,
+        a.g + (b.g - a.g) * u,
+        a.b + (b.b - a.b) * u,
+        a.alpha + (b.alpha - a.alpha) * u,
     )
 end
 
-# Procedural level generator (level 1 fixed pattern; level >=2 random)
-function make_level_data_rand(level::Int)
-    # grid sizing
-    cols, rows = 12, 7
-    margin = 36f0
-    gutter = 12f0
-    scale = 1.35f0
+function ball_radius(cfg::GameConfig)
+    return cfg.ball.radius_at_800 * scale_x(cfg)
+end
 
-    totalw = W - 2f0 * margin
-    bw = (totalw - (cols - 1) * gutter) / cols
-    # make brick field occupy a fixed fraction of screen height (50%)
-    target_frac = 0.50f0
-    area_h      = H * target_frac
-    bh          = (area_h - (Float32(rows) - 1f0) * gutter) / Float32(rows)
+function initial_ball_velocity(cfg::GameConfig, level::Int)
+    level_factor = cfg.ball.level_speed_growth ^ max(level - 1, 0)
+    return cfg.ball.initial_velocity_at_800 * scale_x(cfg) * level_factor
+end
 
-    hud_gap = 48f0
-    y_top_limit = H - hud_gap
-    y0 = y_top_limit - bh - (rows - 1f0) * (bh + gutter)
+function paddle_from_config(cfg::GameConfig)
+    sx, sy = scale_x(cfg), scale_y(cfg)
+    w = cfg.paddle.width_at_800 * sx
+    h = cfg.paddle.height_at_800 * sx
+    y = cfg.paddle.y_at_600 * sy
+    return Paddle(cfg.world.width / 2 - w / 2, y, w, h, cfg.paddle.speed_at_800 * sx)
+end
 
-    bricks = GeometryBasics.Rect{2,Float32}[]
-    hps    = Int[]
-    colors = RGBAf[]
+function make_level(rng::AbstractRNG, cfg::GameConfig, level::Int)
+    lc = cfg.level
+    cols, rows = lc.cols, lc.rows
+    totalw = cfg.world.width - 2f0 * lc.margin
+    bw = (totalw - (cols - 1) * lc.gutter) / cols
+    area_h = cfg.world.height * lc.field_height_fraction
+    bh = (area_h - (Float32(rows) - 1f0) * lc.gutter) / Float32(rows)
+    y_top = cfg.world.height - lc.hud_gap
+    y0 = y_top - bh - (rows - 1f0) * (bh + lc.gutter)
 
-    c  = (cols + 1) / 2
-    rm = (rows + 1) / 2
+    bricks = Brick[]
+    center_col = (cols + 1) / 2
+    center_row = (rows + 1) / 2
+    pattern = rand(rng, 1:6)
+    offset = rand(rng, 0:1)
+    period = rand(rng, 3:4)
+    width = rand(rng, 1:2)
+    amplitude = Float32(rand(rng, 1:2))
+    frequency = rand(rng, 1:2)
+    phase = rand(rng, Float32) * 2f0 * Float32(pi)
+    thickness = rand(rng, 1:2)
+    radius = rand(rng, 2:3)
+    centers = [(rand(rng, 1:cols), rand(rng, 2:rows)) for _ in 1:rand(rng, 2:3)]
 
-    # pick one pattern per level with random params
-    pat = rand(1:6)
-    off = rand(0:1)
-    period = rand(3:4)
-    width = rand(1:2)
-    amp = rand(1.0:1.0:2.0)  # amplitude in rows
-    freq = rand(1:2)
-    phase = rand() * 2f0 * Float32(pi)
-    thick = rand(0:1) + 1  # 1..2
-    rad = rand(2:3)
-    ncent = rand(2:3)
-    centers = [(rand(1:cols), rand(2:rows)) for _ = 1:ncent]
-
-    placed = 0
-
-    for j = 1:rows, i = 1:cols
-        x = margin + (i - 1f0) * (bw + gutter)
-        y = y0 + (j - 1f0) * (bh + gutter)
-
+    for row in 1:rows, col in 1:cols
         keep = false
-        hp   = 1
-
+        hp = 1
         if level <= 1
-            # Original level-1 pattern
-            keep = isodd(i + j)
-            hp = 1
-        elseif pat == 1
-            # Checkerboard with offset and a filled band near center
-            keep = isodd(i + j + off) || (abs(i - c) <= 1 && isodd(j + off))
-            hp   = j <= rm ? 1 : 2
-        elseif pat == 2
-            # Vertical bars with adjustable period/width
-            keep = ((i + off) % period) < width
-            hp   = j >= rows - 2 ? 2 : 1
-        elseif pat == 3
-            # Sine wave ribbon(s)
-            yline = rm + amp * sin(phase + (2f0 * Float32(pi) * freq) * ((i - 1f0) / cols))
-            keep = abs(j - yline) <= thick
-            hp = abs(j - rm) <= 1 ? 2 : 1
-        elseif pat == 4
-            # Diamond / rhombus fill
-            keep = (abs(i - c) + abs(j - rm)) <= (rad + (isodd(i + j) ? 1 : 0))
-            hp   = j < rm ? 1 : (j > rm ? 3 : 2)
-        elseif pat == 5
-            # Border + diagonals
-            border = (i == 1 || i == cols || j == 1 || j == rows)
-            diag   = (abs(i - j) <= 1) || (abs((cols - i + 1) - j) <= 1)
-            keep   = border || (diag && isodd(i + j + off))
-            hp     = border ? 2 : 1
+            keep = isodd(col + row)
+        elseif pattern == 1
+            keep = isodd(col + row + offset) || (abs(col - center_col) <= 1 && isodd(row + offset))
+            hp = row <= center_row ? 1 : 2
+        elseif pattern == 2
+            keep = ((col + offset) % period) < width
+            hp = row >= rows - 2 ? 2 : 1
+        elseif pattern == 3
+            yline = center_row + amplitude * sin(phase + (2f0 * Float32(pi) * frequency) * ((col - 1f0) / cols))
+            keep = abs(row - yline) <= thickness
+            hp = abs(row - center_row) <= 1 ? 2 : 1
+        elseif pattern == 4
+            keep = (abs(col - center_col) + abs(row - center_row)) <= (radius + (isodd(col + row) ? 1 : 0))
+            hp = row < center_row ? 1 : (row > center_row ? 3 : 2)
+        elseif pattern == 5
+            border = col == 1 || col == cols || row == 1 || row == rows
+            diag = abs(col - row) <= 1 || abs((cols - col + 1) - row) <= 1
+            keep = border || (diag && isodd(col + row + offset))
+            hp = border ? 2 : 1
         else
-            # Clustered blobs around random centers
-            keep_any = false
-            for (cx, cy) in centers
-                if (abs(i - cx) + abs(j - cy)) <= rad
-                    keep_any = true
-                    break
-                end
-            end
-            keep = keep_any && (rand() < 0.85)
-            hp   = (abs(j - rm) <= 1) ? 2 : 1
+            keep = any(abs(col - cx) + abs(row - cy) <= radius for (cx, cy) in centers) && rand(rng, Float32) < 0.85f0
+            hp = abs(row - center_row) <= 1 ? 2 : 1
         end
 
-        # Light random holes to reduce monotony
-        if keep && rand() < 0.06
-            keep = false
-        end
-
+        keep && rand(rng, Float32) < lc.random_hole_probability && (keep = false)
         if keep
-            push!(bricks, rectf(x, y, bw, bh))
-            push!(hps, hp)
-            push!(colors, hp_color(hp))
-            placed += 1
+            x = lc.margin + (col - 1f0) * (bw + lc.gutter)
+            y = y0 + (row - 1f0) * (bh + lc.gutter)
+            push!(bricks, Brick(rectf(x, y, bw, bh), hp, hp_color(hp), 0f0))
         end
     end
 
-    # Ensure a minimum density for playability; fallback to dense stripes
-    if placed < 14
+    if length(bricks) < lc.min_bricks
         empty!(bricks)
-        empty!(hps)
-        empty!(colors)
-        for j = 1:rows, i = 1:cols
-            x    = margin + (i - 1f0) * (bw + gutter)
-            y    = y0 + (j - 1f0) * (bh + gutter)
-            keep = ((i + off) % 3) < 2
-            hp   = j >= rows - 2 ? 2 : 1
-            if keep
-                push!(bricks, rectf(x, y, bw, bh))
-                push!(hps, hp)
-                push!(colors, hp_color(hp))
+        for row in 1:rows, col in 1:cols
+            if ((col + offset) % 3) < 2
+                x = lc.margin + (col - 1f0) * (bw + lc.gutter)
+                y = y0 + (row - 1f0) * (bh + lc.gutter)
+                hp = row >= rows - 2 ? 2 : 1
+                push!(bricks, Brick(rectf(x, y, bw, bh), hp, hp_color(hp), 0f0))
             end
         end
     end
-
-    return bricks, hps, colors
+    return LevelState(level, bricks)
 end
 
-function circle_rect_overlap(c::Point2f, r::Float32, rect::GeometryBasics.Rect{2,Float32})
-    x1, y1, x2, y2 = rect_bounds(rect)
-    nx = clamp(c[1], x1, x2)
-    ny = clamp(c[2], y1, y2)
-    dx = c[1] - nx
-    dy = c[2] - ny
-    return dx * dx + dy * dy ≤ r * r
+function new_game(cfg::GameConfig=GameConfig())
+    rng = MersenneTwister(rand(UInt))
+    paddle = paddle_from_config(cfg)
+    level = make_level(rng, cfg, 1)
+    ball = Ball(P2(0f0, 0f0), initial_ball_velocity(cfg, 1), Inf32)
+    balls = BallState(ball, Ball[], false, Point2f[])
+    powerups = PowerupState(PowerupItem[], LaserShot[], 0f0, 0f0, 0f0, cfg.powerup.drops_per_level)
+    game = Game(cfg, rng, paddle, balls, level, powerups, FxState(Particle[]), ComboState(0), 0, cfg.starting_lives, false)
+    reset_ball!(game)
+    return game
 end
 
-# rough collision normal
-function collision_normal(p_prev::Point2f, p_new::Point2f, r::Float32, rect::GeometryBasics.Rect{2,Float32})
-    x1, y1, x2, y2 = rect_bounds(rect)
-    left = (p_new[1] + r) - x1
-    right = x2 - (p_new[1] - r)
-    bottom = (p_new[2] + r) - y1
-    top = y2 - (p_new[2] - r)
-    mins = [(left, 1), (right, 2), (bottom, 3), (top, 4)]
-    _, idx = findmin(first.(mins))
-    sel = mins[idx][2]
-    if sel == 1 || sel == 2
-        return (p_prev[1] ≤ x1) ? V2(-1f0, 0f0) : (p_prev[1] ≥ x2 ? V2(1f0, 0f0) : (left < right ? V2(-1f0, 0f0) : V2(1f0, 0f0)))
-    else
-        return (p_prev[2] ≤ y1) ? V2(0f0, -1f0) : (p_prev[2] ≥ y2 ? V2(0f0, 1f0) : (bottom < top ? V2(0f0, -1f0) : V2(0f0, 1f0)))
+function reset_ball!(game::Game)
+    r = ball_radius(game.cfg)
+    game.balls.main.pos = P2(game.paddle.x + game.paddle.w / 2, game.paddle.y + game.paddle.h + r + 1f0)
+    game.balls.main.vel = initial_ball_velocity(game.cfg, game.level.index)
+    game.balls.main.ttl = Inf32
+    game.balls.launched = false
+    empty!(game.balls.trail)
+    nothing
+end
+
+function reset_combo!(game::Game)
+    game.combo.count = 0
+    nothing
+end
+
+function reset_fx!(game::Game)
+    empty!(game.fx.particles)
+    for brick in game.level.bricks
+        brick.flash = 0f0
     end
+    nothing
 end
 
-# NOTE: include paddle_h to avoid UndefVarError and place ball correctly
-function reset_ball!(
-    ball_center::Observable{Point2f}, ball_vel::Base.RefValue{Vec2f}, launched::Observable{Bool},
-    paddle_x::Float32, paddle_w::Float32, paddle_y::Float32, paddle_h::Float32,
-    r::Float32,
-    trail_pts::Observable{Vector{Point2f}}, trail_cols::Observable{Vector{RGBAf}},
-)
-    ball_center[] = P2(paddle_x + paddle_w / 2, paddle_y + paddle_h + r + 1f0)
-    # scale initial speed with screen width baseline 800
-    s            = W / 800f0
-    ball_vel[]   = V2(176f0 * s, 264f0 * s)     # 1.1x initial speed, scaled
-    launched[]   = false
-    trail_pts[]  = Point2f[]
-    trail_cols[] = RGBAf[]
+function reset_powerups!(game::Game)
+    empty!(game.powerups.items)
+    empty!(game.powerups.shots)
+    game.powerups.pierce_ttl = 0f0
+    game.powerups.laser_ttl = 0f0
+    game.powerups.next_shot = 0f0
+    game.powerups.drops_left = game.cfg.powerup.drops_per_level
+    empty!(game.balls.extras)
+    nothing
 end
 
-# --- Power‑up helpers ---
-@inline function pu_color(sym::Symbol)
-    sym === :pierce && return COLOR_PU_PIERCE
-    sym === :multiball && return COLOR_PU_MULTIBAL
-    sym === :laser && return COLOR_PU_LASER
-    return COLOR_TEXT
+function set_level!(game::Game, level::Int)
+    clamped = clamp(level, game.cfg.level.manual_min, game.cfg.level.manual_max)
+    game.level = make_level(game.rng, game.cfg, clamped)
+    reset_fx!(game)
+    reset_powerups!(game)
+    reset_combo!(game)
+    reset_ball!(game)
+    nothing
 end
 
-# weighted choice among implemented types
-function sample_powerup()
-    types   = (:pierce, :multiball, :laser)
-    weights = (0.4, 0.35, 0.25)  # tweakable
-    u       = rand() * sum(weights)
-    acc     = 0.0
-    for (t, w) in zip(types, weights)
-        acc += w
-        if u ≤ acc
-            return t
+function reset_run!(game::Game)
+    game.score = 0
+    game.lives = game.cfg.starting_lives
+    game.level = make_level(game.rng, game.cfg, 1)
+    reset_fx!(game)
+    reset_powerups!(game)
+    reset_combo!(game)
+    reset_ball!(game)
+    nothing
+end
+
+function lose_life!(game::Game)
+    game.lives -= 1
+    game.lives <= 0 ? reset_run!(game) : (reset_powerups!(game); reset_combo!(game); reset_ball!(game))
+    nothing
+end
+
+function circle_rect_overlap(c::Point2f, radius::Float32, rect::Rect2)
+    x1, y1, x2, y2 = rect_bounds(rect)
+    nearest = P2(clamp(c[1], x1, x2), clamp(c[2], y1, y2))
+    delta = c - nearest
+    return dot(delta, delta) <= radius * radius
+end
+
+function collision_normal(prev::Point2f, pos::Point2f, radius::Float32, rect::Rect2)
+    x1, y1, x2, y2 = rect_bounds(rect)
+    penetration = (
+        ((pos[1] + radius) - x1, V2(-1f0, 0f0)),
+        (x2 - (pos[1] - radius), V2(1f0, 0f0)),
+        ((pos[2] + radius) - y1, V2(0f0, -1f0)),
+        (y2 - (pos[2] - radius), V2(0f0, 1f0)),
+    )
+    _, normal = findmin(first, penetration)
+    n = penetration[normal][2]
+    if n[1] != 0
+        return prev[1] <= x1 ? V2(-1f0, 0f0) : (prev[1] >= x2 ? V2(1f0, 0f0) : n)
+    end
+    return prev[2] <= y1 ? V2(0f0, -1f0) : (prev[2] >= y2 ? V2(0f0, 1f0) : n)
+end
+
+function clamp_speed(v::Vec2f, max_speed::Float32)
+    speed = norm(v)
+    return speed > max_speed ? v * (max_speed / speed) : v
+end
+
+function rotate_velocity(v::Vec2f, angle::Float32)
+    c, s = cos(angle), sin(angle)
+    return V2(v[1] * c - v[2] * s, v[1] * s + v[2] * c)
+end
+
+function add_particles!(game::Game, center::Point2f, color::RGBAf, count::Int, speed_range, ttl_range)
+    sx = scale_x(game.cfg)
+    min_speed, max_speed = speed_range
+    min_ttl, max_ttl = ttl_range
+    for _ in 1:count
+        angle = 2f0 * Float32(pi) * rand(game.rng, Float32)
+        speed = (min_speed + rand(game.rng, Float32) * (max_speed - min_speed)) * sx
+        ttl = min_ttl + rand(game.rng, Float32) * (max_ttl - min_ttl)
+        push!(game.fx.particles, Particle(center, V2(cos(angle) * speed, sin(angle) * speed), ttl, ttl, color))
+    end
+    nothing
+end
+
+function score_multiplier(game::Game)
+    c = game.cfg.score
+    return 1f0 + c.combo_step * clamp(game.combo.count - 1, 0, c.combo_cap)
+end
+
+function sample_powerup(game::Game)
+    weights = game.cfg.powerup.weights
+    roll = rand(game.rng, Float32) * sum(weights)
+    roll <= weights[1] && return Pierce
+    roll <= weights[1] + weights[2] && return Multiball
+    return Laser
+end
+
+function maybe_drop_powerup!(game::Game, center::Point2f)
+    p = game.powerups
+    cfg = game.cfg.powerup
+    if p.drops_left > 0 && rand(game.rng, Float32) <= cfg.drop_probability
+        push!(p.items, PowerupItem(center, V2(0f0, cfg.item_start_speed), sample_powerup(game)))
+        p.drops_left -= 1
+    end
+    nothing
+end
+
+function activate_powerup!(game::Game, kind::PowerupKind)
+    p = game.powerups
+    cfg = game.cfg.powerup
+    if kind == Pierce
+        p.pierce_ttl = max(p.pierce_ttl, cfg.pierce_duration)
+    elseif kind == Laser
+        p.laser_ttl = max(p.laser_ttl, cfg.laser_duration)
+        p.next_shot = 0f0
+    elseif kind == Multiball
+        n = max(cfg.multiball_count, 0)
+        n == 0 && return
+        arc = cfg.multiball_arc_radians
+        angles = n == 1 ? (0f0,) : LinRange(-arc / 2, arc / 2, n)
+        speed = norm(game.balls.main.vel)
+        for angle in angles
+            vel = rotate_velocity(game.balls.main.vel, Float32(angle))
+            vel = norm(vel) > 0f0 ? vel * (speed / norm(vel)) : game.balls.main.vel
+            push!(game.balls.extras, Ball(game.balls.main.pos, vel, cfg.child_ttl))
         end
     end
-    return :pierce
+    nothing
 end
 
-# spawn a falling item at cpos
-function maybe_drop!(pu::PUState, cpos::Point2f)
-    if pu.drops_left ≤ 0
+function hit_brick!(game::Game, index::Int, multiplier::Float32; can_drop::Bool=true)
+    brick = game.level.bricks[index]
+    x1, y1, x2, y2 = rect_bounds(brick.rect)
+    center = P2((x1 + x2) / 2, (y1 + y2) / 2)
+    color = brick.color
+    brick.hp -= 1
+    if brick.hp <= 0
+        add_particles!(game, center, color, game.cfg.fx.destroyed_particles,
+            game.cfg.fx.destroyed_speed_range_at_800, game.cfg.fx.destroyed_ttl_range)
+        deleteat!(game.level.bricks, index)
+        game.score += Int(round(game.cfg.score.destroyed_brick * multiplier))
+        can_drop && maybe_drop_powerup!(game, center)
+    else
+        brick.flash = game.cfg.fx.flash_duration
+        brick.color = hp_color(brick.hp)
+        add_particles!(game, center, color, game.cfg.fx.damaged_particles,
+            game.cfg.fx.damaged_speed_range_at_800, game.cfg.fx.damaged_ttl_range)
+        game.score += Int(round(game.cfg.score.damaged_brick * multiplier))
+    end
+    nothing
+end
+
+function register_combo_hit!(game::Game)
+    game.combo.count += 1
+    return score_multiplier(game)
+end
+
+function paddle_rect(game::Game)
+    p = game.paddle
+    return rectf(p.x, p.y, p.w, p.h)
+end
+
+function bounce_from_paddle!(game::Game, ball::Ball)
+    p = game.paddle
+    rel = clamp((ball.pos[1] - (p.x + p.w / 2)) / (p.w / 2), -1f0, 1f0)
+    speed = norm(ball.vel)
+    min_angle = deg2rad(game.cfg.ball.min_bounce_degrees)
+    max_angle = deg2rad(game.cfg.ball.max_bounce_degrees)
+    angle = min_angle + (max_angle - min_angle) * abs(rel)
+    direction_x = (rel == 0f0 ? sign(ball.vel[1] == 0f0 ? 1f0 : ball.vel[1]) : sign(rel)) * sin(angle)
+    direction_y = cos(angle)
+    dir = normalize(V2(direction_x, max(direction_y, 0.2f0)))
+    ball.vel = V2(dir[1] * speed, abs(dir[2] * speed))
+    ball.pos = P2(ball.pos[1], p.y + p.h + ball_radius(game.cfg) + 0.1f0)
+    reset_combo!(game)
+    nothing
+end
+
+function step_ball!(game::Game, ball::Ball, dt::Float32)
+    r = ball_radius(game.cfg)
+    previous = ball.pos
+    ball.pos = P2(ball.pos[1] + ball.vel[1] * dt, ball.pos[2] + ball.vel[2] * dt)
+
+    if ball.pos[1] - r < 0f0
+        ball.pos = P2(r, ball.pos[2])
+        ball.vel = V2(abs(ball.vel[1]), ball.vel[2])
+    elseif ball.pos[1] + r > game.cfg.world.width
+        ball.pos = P2(game.cfg.world.width - r, ball.pos[2])
+        ball.vel = V2(-abs(ball.vel[1]), ball.vel[2])
+    end
+    if ball.pos[2] + r > game.cfg.world.height
+        ball.pos = P2(ball.pos[1], game.cfg.world.height - r)
+        ball.vel = V2(ball.vel[1], -abs(ball.vel[2]))
+    end
+
+    if ball.vel[2] < 0f0 && circle_rect_overlap(ball.pos, r, paddle_rect(game))
+        bounce_from_paddle!(game, ball)
+    end
+
+    for i in eachindex(game.level.bricks)
+        brick = game.level.bricks[i]
+        if circle_rect_overlap(ball.pos, r, brick.rect)
+            normal = collision_normal(previous, ball.pos, r, brick.rect)
+            multiplier = register_combo_hit!(game)
+            hit_brick!(game, i, multiplier)
+            if game.powerups.pierce_ttl > 0f0
+                jitter = (rand(game.rng, Float32) - 0.5f0) * 0.08f0
+                ball.vel = rotate_velocity(ball.vel, jitter)
+            else
+                normal[1] != 0f0 && (ball.vel = V2(-ball.vel[1], ball.vel[2]))
+                normal[2] != 0f0 && (ball.vel = V2(ball.vel[1], -ball.vel[2]))
+                ball.pos = P2(ball.pos[1] + normal[1] * 0.5f0, ball.pos[2] + normal[2] * 0.5f0)
+            end
+            break
+        end
+    end
+    ball.vel = clamp_speed(ball.vel, game.cfg.ball.max_speed)
+    return ball.pos[2] - r < 0f0
+end
+
+function update_main_ball!(game::Game, dt::Float32)
+    if !game.balls.launched
+        r = ball_radius(game.cfg)
+        game.balls.main.pos = P2(game.paddle.x + game.paddle.w / 2, game.paddle.y + game.paddle.h + r + 1f0)
+        empty!(game.balls.trail)
         return
     end
-    if rand(Float32) ≤ DROP_P
-        typ = sample_powerup()
-        push!(pu.item_pos, cpos)
-        push!(pu.item_vel, V2(0f0, -40f0))   # start slow, gravity will pull
-        push!(pu.item_typ, typ)
-        pu.drops_left -= 1
+
+    dropped = step_ball!(game, game.balls.main, dt)
+    if dropped && !isempty(game.balls.extras)
+        promoted = pop!(game.balls.extras)
+        game.balls.main.pos = promoted.pos
+        game.balls.main.vel = promoted.vel
+        game.balls.main.ttl = Inf32
+        empty!(game.balls.trail)
+        dropped = false
     end
+    dropped && lose_life!(game)
+    nothing
 end
 
-# activate effects on pickup
-function activate!(pu::PUState, typ::Symbol, main_pos::Point2f, main_vel::Vec2f)
-    if typ === :pierce
-        pu.pierce_ttl = max(pu.pierce_ttl, PIERCE_DUR)
-    elseif typ === :laser
-        pu.laser_ttl = max(pu.laser_ttl, LASER_DUR)
-        pu.next_shot = min(pu.next_shot, 0f0)  # allow immediate firing
-    elseif typ === :multiball
-        # spawn +2 child balls by rotating main vel slightly
-        speed = sqrt(main_vel[1]^2 + main_vel[2]^2)
-        for θ in (-0.25f0, 0.25f0)  # ~±14°
-            c = cos(θ)
-            s = sin(θ)
-            v = V2(main_vel[1] * c - main_vel[2] * s, main_vel[1] * s + main_vel[2] * c)
-            v *= (speed / sqrt(v[1]^2 + v[2]^2))
-            push!(pu.ball_pos, main_pos)
-            push!(pu.ball_vel, v)
-            push!(pu.ball_ttl, CHILD_TTL)
-        end
-    end
-end
-
-# apply slight random deflection while piercing to avoid straight tunnels
-@inline function pierce_jitter(v::Vec2f)
-    θ = (rand(Float32) - 0.5f0) * 0.08f0   # ±~4.6°
-    c = cos(θ)
-    s = sin(θ)
-    vv = V2(v[1] * c - v[2] * s, v[1] * s + v[2] * c)
-    sp = sqrt(v[1]^2 + v[2]^2)
-    return vv * (sp / sqrt(vv[1]^2 + vv[2]^2))
-end
-
-# common brick hit handling (returns score delta and whether brick destroyed)
-function apply_brick_hit!(i::Int, bricks::Vector{GeometryBasics.Rect{2,Float32}}, hps::Vector{Int}, base_cols::Vector{RGBAf}, fx::FXState, score_mult::Float32)
-    rect = bricks[i]
-    x1, y1, x2, y2 = rect_bounds(rect)
-    cpos = P2((x1 + x2) / 2, (y1 + y2) / 2)
-    col_pre = base_cols[i]
-    hps[i] -= 1
-    if hps[i] ≤ 0
-        # break particles
-        local sw = W / 800f0
-        for _ = 1:28
-            θ = 2f0 * Float32(pi) * rand(Float32)
-            s = (rand(Float32) * 160f0 + 120f0) * sw
-            push!(fx.ppos, cpos)
-            push!(fx.pvel, V2(cos(θ) * s, sin(θ) * s))
-            t = rand(Float32) * 0.35f0 + 0.45f0
-            push!(fx.pttl, t)
-            push!(fx.ptmax, t)
-            push!(fx.pcol, col_pre)
-        end
-        deleteat!(bricks, i)
-        deleteat!(hps, i)
-        deleteat!(base_cols, i)
-        deleteat!(fx.bflash, i)
-        return Int(round(100 * score_mult)), true, cpos
-    else
-        fx.bflash[i] = FLASH_MAX
-        base_cols[i] = hp_color(hps[i])
-        local sw = W / 800f0
-        for _ = 1:12
-            θ = 2f0 * Float32(pi) * rand(Float32)
-            s = (rand(Float32) * 120f0 + 90f0) * sw
-            push!(fx.ppos, cpos)
-            push!(fx.pvel, V2(cos(θ) * s, sin(θ) * s))
-            t = rand(Float32) * 0.25f0 + 0.25f0
-            push!(fx.pttl, t)
-            push!(fx.ptmax, t)
-            push!(fx.pcol, col_pre)
-        end
-        return Int(round(50 * score_mult)), false, cpos
-    end
-end
-
-function update!(scene,
-    dt::Float64,
-    ball_center::Observable{Point2f}, ball_vel_ref::Base.RefValue{Vec2f}, r::Float32,
-    paddle_x::Observable{Float32}, paddle_y::Float32, paddle_w::Float32, paddle_h::Float32, paddle_speed::Float32,
-    launched::Observable{Bool},
-    bricks_obs::Observable{Vector{GeometryBasics.Rect{2,Float32}}},
-    brick_hp_obs::Observable{Vector{Int}},
-    brick_color_obs::Observable{Vector{RGBAf}},
-    score::Observable{Int}, lives::Observable{Int}, trail_pts::Observable{Vector{Point2f}}, trail_cols::Observable{Vector{RGBAf}},
-    part_pos_obs::Observable{Vector{Point2f}}, part_col_obs::Observable{Vector{RGBAf}}, fx::FXState,
-    brick_base_colors_obs::Observable{Vector{RGBAf}}, combo_count::Observable{Int}, combo_timer::Observable{Float32}, combo_text::Observable{String}, combo_color::Observable{RGBAf}, level::Observable{Int},
-    # power‑up runtime & visuals
-    pu::PUState, items_pos_obs::Observable{Vector{Point2f}}, items_col_obs::Observable{Vector{RGBAf}},
-    shots_pos_obs::Observable{Vector{Point2f}}, extras_pos_obs::Observable{Vector{Point2f}}, ball_colors_obs::Observable{Vector{RGBAf}}, pierce_txt::Observable{String}, laser_txt::Observable{String})
-
-    # input → paddle
-    vx = 0f0
-    ispressed(scene, Keyboard.left) && (vx -= paddle_speed)
-    ispressed(scene, Keyboard.a) && (vx -= paddle_speed)
-    ispressed(scene, Keyboard.right) && (vx += paddle_speed)
-    ispressed(scene, Keyboard.d) && (vx += paddle_speed)
-
-    x = paddle_x[] + vx * Float32(dt)
-    x = clamp(x, 0f0, W - paddle_w)
-    paddle_x[] = x
-
-    # stick to paddle before launch
-    if !launched[]
-        ball_center[] = P2(x + paddle_w / 2, paddle_y + paddle_h + r + 1f0)
-    end
-
-    # fire lasers if active
-    if pu.laser_ttl > 0f0
-        pu.next_shot -= Float32(dt)
-        if pu.next_shot ≤ 0f0
-            # spawn two shots from paddle edges
-            off = paddle_w * 0.35f0
-            y0  = paddle_y + paddle_h + 2f0
-            push!(pu.shot_pos, P2(paddle_x[] + off, y0))
-            push!(pu.shot_vel, V2(0f0, SHOT_SPEED))
-            push!(pu.shot_ttl, SHOT_TTL)
-            push!(pu.shot_pos, P2(paddle_x[] + paddle_w - off, y0))
-            push!(pu.shot_vel, V2(0f0, SHOT_SPEED))
-            push!(pu.shot_ttl, SHOT_TTL)
-            pu.next_shot = SHOT_COOLD
-        end
-    end
-
-    # helper to advance one ball (returns new pos, vel)
-    function step_ball(p::Point2f, v::Vec2f)
-        p_new = P2(p[1] + v[1] * Float32(dt), p[2] + v[2] * Float32(dt))
-        # walls
-        if p_new[1] - r < 0f0
-            p_new = P2(r, p_new[2])
-            v = V2(abs(v[1]), v[2])
-        elseif p_new[1] + r > W
-            p_new = P2(W - r, p_new[2])
-            v = V2(-abs(v[1]), v[2])
-        end
-        if p_new[2] + r > H
-            p_new = P2(p_new[1], H - r)
-            v = V2(v[1], -abs(v[2]))
-        end
-        # paddle
-        padd = rectf(paddle_x[], paddle_y, paddle_w, paddle_h)
-        if circle_rect_overlap(p_new, r, padd)
-            cx = p_new[1]
-            px = paddle_x[] + paddle_w / 2
-            rel = clamp((cx - px) / (paddle_w / 2), -1f0, 1f0)
-            speed = sqrt(v[1]^2 + v[2]^2)
-            min_deg = 25f0
-            max_deg = 70f0
-            angle = deg2rad(min_deg + (max_deg - min_deg) * abs(rel))
-            sx = (rel == 0f0 ? sign(v[1] == 0f0 ? 1f0 : v[1]) : sign(rel))
-            dirx = sx * sin(angle)
-            diry = cos(angle)
-            if diry < 0.2f0
-                diry = 0.2f0
-            end
-            dnorm = sqrt(dirx^2 + diry^2)
-            dirx /= dnorm
-            diry /= dnorm
-            v = V2(dirx * speed, diry * speed)
-            v = V2(v[1], abs(v[2]))
-            p_new = P2(p_new[1], paddle_y + paddle_h + r + 0.1f0)
-            # reset combo on any paddle contact
-            combo_count[] = 0
-            combo_timer[] = 0f0
-            combo_text[]  = ""
-            combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)
-        end
-        # bricks
-        bricks = bricks_obs[]
-        hps = brick_hp_obs[]
-        base_cols = brick_base_colors_obs[]
-        hit_idx = 0
-        nrm = V2(0f0, 0f0)
-        for (i, rect) in pairs(bricks)
-            if circle_rect_overlap(p_new, r, rect)
-                nrm = collision_normal(p, p_new, r, rect)
-                hit_idx = i
-                break
-            end
-        end
-        if hit_idx != 0
-            # combo HUD update
-            combo_count[] += 1
-            combo_timer[] = COMBO_WINDOW
-            mult          = 1f0 + 0.1f0 * clamp(combo_count[] - 1, 0, 10)
-            combo_text[]  = "COMBO x$(combo_count[])  ×$(round(mult; digits=1))"
-            combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 1f0)
-
-            # apply damage & particles
-            add, destroyed, cpos = apply_brick_hit!(hit_idx, bricks, hps, base_cols, fx, Float32(mult))
-            score[] += add
-            if destroyed
-                maybe_drop!(pu, cpos)
-            end
-            # reflect or pierce
-            if pu.pierce_ttl > 0f0
-                v = pierce_jitter(v)  # no reflection; slight deflection
-            else
-                if nrm[1] != 0
-                    v = V2(-v[1], v[2])
-                end
-                if nrm[2] != 0
-                    v = V2(v[1], -v[2])
-                end
-                p_new = P2(p_new[1] + 0.5f0 * nrm[1], p_new[2] + 0.5f0 * nrm[2])
-            end
-            bricks_obs[] = bricks
-            brick_hp_obs[] = hps
-            brick_base_colors_obs[] = base_cols
-        end
-        return p_new, v
-    end
-
-    # main ball life‑loss check (only for the main ball)
-    if launched[]
-        p = ball_center[]
-        v = ball_vel_ref[]
-        p, v = step_ball(p, v)
-        # if main ball dropped but extras exist, promote one extra to main
-        if p[2] - r < 0f0 && !isempty(pu.ball_pos)
-            idx = length(pu.ball_pos)
-            p = pu.ball_pos[idx]
-            v = pu.ball_vel[idx]
-            deleteat!(pu.ball_pos, idx)
-            deleteat!(pu.ball_vel, idx)
-            deleteat!(pu.ball_ttl, idx)
-            trail_pts[] = Point2f[]
-            trail_cols[] = RGBAf[]
-        end
-        if p[2] - r < 0f0
-            # life lost
-            lives[] -= 1
-            if lives[] ≤ 0
-                lives[] = 3
-                score[] = 0
-                level[] = 1
-                b, hps, cols = make_level_data_rand(level[])
-                bricks_obs[] = b
-                brick_hp_obs[] = hps
-                brick_color_obs[] = cols
-                brick_base_colors_obs[] = copy(cols)
-                fx.bflash = fill(0f0, length(b))
-                pu.drops_left = DROP_BUDGET
-                pu.item_pos = Point2f[]
-                pu.item_vel = Vec2f[]
-                pu.item_typ = Symbol[]
-                pu.ball_pos = Point2f[]
-                pu.ball_vel = Vec2f[]
-                pu.ball_ttl = Float32[]
-                pu.shot_pos = Point2f[]
-                pu.shot_vel = Vec2f[]
-                pu.shot_ttl = Float32[]
-                pu.pierce_ttl = 0f0
-                pu.laser_ttl = 0f0
-                pu.next_shot = 0f0
-            end
-            combo_count[] = 0
-            combo_timer[] = 0f0
-            combo_text[] = ""
-            combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)
-            # clear all power-up side effects upon life loss
-            pu.item_pos = Point2f[]
-            pu.item_vel = Vec2f[]
-            pu.item_typ = Symbol[]
-            pu.ball_pos = Point2f[]
-            pu.ball_vel = Vec2f[]
-            pu.ball_ttl = Float32[]
-            pu.shot_pos = Point2f[]
-            pu.shot_vel = Vec2f[]
-            pu.shot_ttl = Float32[]
-            pu.pierce_ttl = 0f0
-            pu.laser_ttl = 0f0
-            pu.next_shot = 0f0
-            items_pos_obs[] = Point2f[]
-            items_col_obs[] = RGBAf[]
-            shots_pos_obs[] = Point2f[]
-            extras_pos_obs[] = Point2f[]
-            reset_ball!(ball_center, ball_vel_ref, launched, paddle_x[], paddle_w, paddle_y, paddle_h, r, trail_pts, trail_cols)
-        else
-            # clamp speed
-            maxspeed = 600f0
-            s = sqrt(v[1]^2 + v[2]^2)
-            if s > maxspeed
-                v *= (maxspeed / s)
-            end
-            ball_center[]  = p
-            ball_vel_ref[] = v
-        end
-    end
-
-    # update child balls (no life loss on drop)
-    i = length(pu.ball_pos)
-    while i ≥ 1
-        pu.ball_ttl[i] -= Float32(dt)
-        if pu.ball_ttl[i] ≤ 0f0
-            deleteat!(pu.ball_pos, i)
-            deleteat!(pu.ball_vel, i)
-            deleteat!(pu.ball_ttl, i)
-        else
-            p, v = step_ball(pu.ball_pos[i], pu.ball_vel[i])
-            if p[2] - r < 0f0
-                deleteat!(pu.ball_pos, i)
-                deleteat!(pu.ball_vel, i)
-                deleteat!(pu.ball_ttl, i)
-            else
-                # clamp and store
-                maxspeed = 600f0
-                s = sqrt(v[1]^2 + v[2]^2)
-                if s > maxspeed
-                    v *= (maxspeed / s)
-                end
-                pu.ball_pos[i] = p
-                pu.ball_vel[i] = v
-            end
-        end
+function update_extra_balls!(game::Game, dt::Float32)
+    i = length(game.balls.extras)
+    while i >= 1
+        ball = game.balls.extras[i]
+        ball.ttl -= dt
+        dropped = ball.ttl <= 0f0 || step_ball!(game, ball, dt)
+        dropped && deleteat!(game.balls.extras, i)
         i -= 1
     end
+    nothing
+end
 
-    # update laser shots
-    i = length(pu.shot_pos)
-    while i ≥ 1
-        pu.shot_ttl[i] -= Float32(dt)
-        if pu.shot_ttl[i] ≤ 0f0
-            deleteat!(pu.shot_pos, i)
-            deleteat!(pu.shot_vel, i)
-            deleteat!(pu.shot_ttl, i)
-        else
-            p = pu.shot_pos[i]
-            v = pu.shot_vel[i]
-            p = P2(p[1] + v[1] * Float32(dt), p[2] + v[2] * Float32(dt))
-            hit = false
-            bricks = bricks_obs[]
-            hps = brick_hp_obs[]
-            base_cols = brick_base_colors_obs[]
-            for (bi, rect) in pairs(bricks)
-                shot_hit_r = 3f0 * (W / 800f0)
-                if circle_rect_overlap(p, shot_hit_r, rect)   # small radius hit (scaled)
-                    add, destroyed, cpos = apply_brick_hit!(bi, bricks, hps, base_cols, fx, 1f0)
-                    score[] += add
-                    hit = true
-                    if destroyed
-                        maybe_drop!(pu, cpos)
-                    end
-                    bricks_obs[] = bricks
-                    brick_hp_obs[] = hps
-                    brick_base_colors_obs[] = base_cols
+function update_lasers!(game::Game, dt::Float32)
+    p = game.powerups
+    cfg = game.cfg.powerup
+    if p.laser_ttl > 0f0
+        p.next_shot -= dt
+        if p.next_shot <= 0f0
+            offset = game.paddle.w * 0.35f0
+            y = game.paddle.y + game.paddle.h + 2f0
+            push!(p.shots, LaserShot(P2(game.paddle.x + offset, y), V2(0f0, cfg.shot_speed), cfg.shot_ttl))
+            push!(p.shots, LaserShot(P2(game.paddle.x + game.paddle.w - offset, y), V2(0f0, cfg.shot_speed), cfg.shot_ttl))
+            p.next_shot = cfg.shot_cooldown
+        end
+    end
+
+    hit_radius = cfg.shot_hit_radius_at_800 * scale_x(game.cfg)
+    i = length(p.shots)
+    while i >= 1
+        shot = p.shots[i]
+        shot.ttl -= dt
+        shot.pos = P2(shot.pos[1] + shot.vel[1] * dt, shot.pos[2] + shot.vel[2] * dt)
+        remove = shot.ttl <= 0f0 || shot.pos[2] > game.cfg.world.height
+        if !remove
+            for bi in eachindex(game.level.bricks)
+                if circle_rect_overlap(shot.pos, hit_radius, game.level.bricks[bi].rect)
+                    hit_brick!(game, bi, 1f0)
+                    remove = true
                     break
                 end
             end
-            if hit || p[2] > H
-                deleteat!(pu.shot_pos, i)
-                deleteat!(pu.shot_vel, i)
-                deleteat!(pu.shot_ttl, i)
-            else
-                pu.shot_pos[i] = p
-            end
+        end
+        remove && deleteat!(p.shots, i)
+        i -= 1
+    end
+    nothing
+end
+
+function update_powerup_items!(game::Game, dt::Float32)
+    cfg = game.cfg.powerup
+    pickup_radius = cfg.item_marker_size_at_800 * scale_x(game.cfg) * cfg.item_pickup_radius_factor
+    pad = paddle_rect(game)
+    i = length(game.powerups.items)
+    while i >= 1
+        item = game.powerups.items[i]
+        item.vel = V2(item.vel[1] * cfg.item_damping, item.vel[2] - cfg.item_gravity * dt)
+        item.pos = P2(item.pos[1] + item.vel[1] * dt, item.pos[2] + item.vel[2] * dt)
+        if circle_rect_overlap(item.pos, pickup_radius, pad)
+            activate_powerup!(game, item.kind)
+            deleteat!(game.powerups.items, i)
+        elseif item.pos[2] < 0f0
+            deleteat!(game.powerups.items, i)
         end
         i -= 1
     end
+    nothing
+end
 
-    # update falling items (gravity + pickup)
-    i = length(pu.item_pos)
-    padd = rectf(paddle_x[], paddle_y, paddle_w, paddle_h)
-    while i ≥ 1
-        v = pu.item_vel[i]
-        v = V2(v[1] * 0.995f0, (v[2] - 220f0 * Float32(dt)))  # gentle gravity + damping
-        p = pu.item_pos[i]
-        p = P2(p[1], p[2] + v[2] * Float32(dt))
-        pu.item_vel[i] = v
-        pu.item_pos[i] = p
-        # pickup: derive radius from rendered item size for consistency
-        items_size = 14f0 * (W / 800f0)
-        pickup_r   = 0.67f0 * items_size
-        if circle_rect_overlap(p, pickup_r, padd)
-            activate!(pu, pu.item_typ[i], ball_center[], ball_vel_ref[])
-            deleteat!(pu.item_pos, i)
-            deleteat!(pu.item_vel, i)
-            deleteat!(pu.item_typ, i)
-        elseif p[2] < 0f0
-            deleteat!(pu.item_pos, i)
-            deleteat!(pu.item_vel, i)
-            deleteat!(pu.item_typ, i)
-        end
-        i -= 1
-    end
-
-    # trail for the main ball only
-    tp_old = trail_pts[]
-    if launched[]
-        tp_new       = length(tp_old) ≥ TRAIL_LEN ? vcat(tp_old[end-TRAIL_LEN+2:end], [ball_center[]]) : vcat(tp_old, [ball_center[]])
-        n            = length(tp_new)
-        alphas       = n == 1 ? Float32[0.35f0] : collect(LinRange{Float32}(0.06f0, 0.35f0, n))
-        tbase        = (pu.pierce_ttl > 0f0) ? COLOR_PU_LASER : COLOR_BALL
-        tcols        = [RGBAf(tbase.r, tbase.g, tbase.b, a) for a in alphas]
-        trail_pts[]  = tp_new
-        trail_cols[] = tcols
-    else
-        trail_pts[] = Point2f[]
-        trail_cols[] = RGBAf[]
-    end
-
-    # flash → display colors
-    base_cols = brick_base_colors_obs[]
-    if length(fx.bflash) != length(base_cols)
-        fx.bflash = fill(0f0, length(base_cols))
-    end
-    disp = Vector{RGBAf}(undef, length(base_cols))
-    for i in eachindex(base_cols)
-        fac = (i ≤ length(fx.bflash) ? clamp(fx.bflash[i] / FLASH_MAX, 0f0, 1f0) : 0f0) * 0.6f0
-        disp[i] = fac > 0 ? mix_rgba(base_cols[i], COLOR_BALL, Float32(fac)) : base_cols[i]
-        fx.bflash[i] = max(0f0, fx.bflash[i] - Float32(dt))
-    end
-    brick_color_obs[] = disp
-
-    # particles
-    i = length(fx.pttl)
-    while i ≥ 1
-        fx.pttl[i] -= Float32(dt)
-        if fx.pttl[i] ≤ 0f0
-            deleteat!(fx.ppos, i)
-            deleteat!(fx.pvel, i)
-            deleteat!(fx.pttl, i)
-            deleteat!(fx.ptmax, i)
-            deleteat!(fx.pcol, i)
+function update_particles!(game::Game, dt::Float32)
+    i = length(game.fx.particles)
+    while i >= 1
+        p = game.fx.particles[i]
+        p.ttl -= dt
+        if p.ttl <= 0f0
+            deleteat!(game.fx.particles, i)
         else
-            fx.ppos[i] = P2(fx.ppos[i][1] + fx.pvel[i][1] * Float32(dt), fx.ppos[i][2] + fx.pvel[i][2] * Float32(dt))
-            fx.pvel[i] = V2(fx.pvel[i][1] * 0.99f0, (fx.pvel[i][2] - 200f0 * Float32(dt)) * 0.99f0)
+            p.pos = P2(p.pos[1] + p.vel[1] * dt, p.pos[2] + p.vel[2] * dt)
+            p.vel = V2(p.vel[1] * game.cfg.fx.particle_damping,
+                (p.vel[2] - game.cfg.fx.particle_gravity * dt) * game.cfg.fx.particle_damping)
         end
         i -= 1
     end
-    part_pos_obs[] = copy(fx.ppos)
-    part_col_obs[] = [RGBAf(c.r, c.g, c.b, clamp(fx.pttl[j] / fx.ptmax[j], 0f0, 1f0) * 0.9f0) for (j, c) in enumerate(fx.pcol)]
+    nothing
+end
 
-    # timers decay
-    pu.pierce_ttl = max(0f0, pu.pierce_ttl - Float32(dt))
-    pu.laser_ttl  = max(0f0, pu.laser_ttl - Float32(dt))
-    # update HUD text for timers
-    pierce_txt[] = pu.pierce_ttl > 0f0 ? @sprintf("Pierce %.1fs", pu.pierce_ttl) : ""
-    laser_txt[]  = pu.laser_ttl > 0f0 ? @sprintf("Laser %.1fs", pu.laser_ttl) : ""
-
-    # level clear → next level
-    if isempty(bricks_obs[])
-        level[] = max(level[] + 1, 2)
-        bricks, hps, cols = make_level_data_rand(level[])
-        bricks_obs[] = bricks
-        brick_hp_obs[] = hps
-        brick_color_obs[] = cols
-        brick_base_colors_obs[] = copy(cols)
-        fx.bflash = fill(0f0, length(bricks))
-        ball_vel_ref[] = V2(ball_vel_ref[][1] * 1.1f0, ball_vel_ref[][2] * 1.1f0)
-        launched[] = false
-        combo_count[] = 0
-        combo_timer[] = 0f0
-        combo_text[] = ""
-        combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)
-        pu.drops_left = DROP_BUDGET
-        pu.item_pos = Point2f[]
-        pu.item_vel = Vec2f[]
-        pu.item_typ = Symbol[]
-        pu.ball_pos = Point2f[]
-        pu.ball_vel = Vec2f[]
-        pu.ball_ttl = Float32[]
-        pu.shot_pos = Point2f[]
-        pu.shot_vel = Vec2f[]
-        pu.shot_ttl = Float32[]
-        pu.pierce_ttl = 0f0
-        pu.laser_ttl = 0f0
-        pu.next_shot = 0f0
+function update_timers!(game::Game, dt::Float32)
+    for brick in game.level.bricks
+        brick.flash = max(0f0, brick.flash - dt)
     end
+    game.powerups.pierce_ttl = max(0f0, game.powerups.pierce_ttl - dt)
+    game.powerups.laser_ttl = max(0f0, game.powerups.laser_ttl - dt)
+    nothing
+end
 
-    # push visuals for power‑ups
-    items_pos_obs[] = copy(pu.item_pos)
-    items_col_obs[] = [pu_color(t) for t in pu.item_typ]
-    shots_pos_obs[] = copy(pu.shot_pos)
-    extras_pos_obs[] = copy(pu.ball_pos)
-    # update ball colors: turn orange‑red while pierce active
-    nb = 1 + length(pu.ball_pos)
-    bcol = pu.pierce_ttl > 0f0 ? COLOR_PU_LASER : COLOR_BALL
-    ball_colors_obs[] = fill(bcol, nb)
+function update_trail!(game::Game)
+    if !game.balls.launched
+        empty!(game.balls.trail)
+        return
+    end
+    push!(game.balls.trail, game.balls.main.pos)
+    overflow = length(game.balls.trail) - game.cfg.ball.trail_length
+    overflow > 0 && deleteat!(game.balls.trail, 1:overflow)
+    nothing
+end
 
-    return
+function clear_level_if_needed!(game::Game)
+    isempty(game.level.bricks) || return
+    next_level = max(game.level.index + 1, 2)
+    game.level = make_level(game.rng, game.cfg, next_level)
+    reset_powerups!(game)
+    reset_combo!(game)
+    reset_ball!(game)
+    nothing
+end
+
+function move_paddle!(game::Game, direction::Real, dt::Float32)
+    dx = Float32(direction) * game.paddle.speed * dt
+    game.paddle.x = clamp(game.paddle.x + dx, 0f0, game.cfg.world.width - game.paddle.w)
+    nothing
+end
+
+function handle_input!(game::Game, scene, dt::Float32)
+    direction = 0f0
+    (ispressed(scene, Keyboard.left) || ispressed(scene, Keyboard.a)) && (direction -= 1f0)
+    (ispressed(scene, Keyboard.right) || ispressed(scene, Keyboard.d)) && (direction += 1f0)
+    move_paddle!(game, direction, dt)
+    nothing
+end
+
+function step_game!(game::Game, scene, dt::Float32)
+    handle_input!(game, scene, dt)
+    update_lasers!(game, dt)
+    update_main_ball!(game, dt)
+    update_extra_balls!(game, dt)
+    update_powerup_items!(game, dt)
+    update_particles!(game, dt)
+    update_timers!(game, dt)
+    update_trail!(game)
+    clear_level_if_needed!(game)
+    nothing
+end
+
+function brick_display_color(game::Game, brick::Brick)
+    factor = game.cfg.fx.flash_duration <= 0f0 ? 0f0 : clamp(brick.flash / game.cfg.fx.flash_duration, 0f0, 1f0) * 0.6f0
+    return factor > 0f0 ? mix_rgba(brick.color, COLOR_BALL, factor) : brick.color
+end
+
+function sync_view!(view::View, game::Game)
+    view.bricks[] = [brick.rect for brick in game.level.bricks]
+    view.brick_colors[] = [brick_display_color(game, brick) for brick in game.level.bricks]
+    view.paddle[] = paddle_rect(game)
+    view.balls[] = vcat([game.balls.main.pos], [ball.pos for ball in game.balls.extras])
+    ball_color = game.powerups.pierce_ttl > 0f0 ? COLOR_PU_LASER : COLOR_BALL
+    view.ball_colors[] = fill(ball_color, 1 + length(game.balls.extras))
+    view.trail_points[] = copy(game.balls.trail)
+    n = length(game.balls.trail)
+    tbase = game.powerups.pierce_ttl > 0f0 ? COLOR_PU_LASER : COLOR_BALL
+    alphas = n == 0 ? Float32[] : (n == 1 ? Float32[0.35f0] : collect(LinRange{Float32}(0.06f0, 0.35f0, n)))
+    view.trail_colors[] = [RGBAf(tbase.r, tbase.g, tbase.b, a) for a in alphas]
+    view.items[] = [item.pos for item in game.powerups.items]
+    view.item_colors[] = [powerup_color(item.kind) for item in game.powerups.items]
+    view.shots[] = [shot.pos for shot in game.powerups.shots]
+    view.particles[] = [p.pos for p in game.fx.particles]
+    view.particle_colors[] = [RGBAf(p.color.r, p.color.g, p.color.b, clamp(p.ttl / p.ttl_max, 0f0, 1f0) * 0.9f0) for p in game.fx.particles]
+    view.score_text[] = "Score: $(game.score)"
+    view.lives_text[] = "Lives: $(game.lives)"
+    view.level_text[] = "Level: $(game.level.index)"
+    view.pierce_text[] = game.powerups.pierce_ttl > 0f0 ? @sprintf("Pierce %.1fs", game.powerups.pierce_ttl) : ""
+    view.laser_text[] = game.powerups.laser_ttl > 0f0 ? @sprintf("Laser %.1fs", game.powerups.laser_ttl) : ""
+    if game.combo.count > 0
+        view.combo_text[] = "COMBO x$(game.combo.count)  x$(round(score_multiplier(game); digits=1))"
+        view.combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 1f0)
+    else
+        view.combo_text[] = ""
+        view.combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)
+    end
+    hint = game.balls.launched ? "" : "Press SPACE to launch  |  A/D or Left/Right move  |  P pause\n[ / ] prev/next level  |  R reset"
+    view.hint_text[] = hint
+    line_count = isempty(hint) ? 0 : count(==('\n'), hint) + 1
+    hint_height = Float32(HINT_FONT_SIZE) * HINT_LINE_HEIGHT * line_count
+    hint_y = game.cfg.world.height * 0.5f0
+    view.hint_bg[] = isempty(hint) ? Rect2[] : [rectf(0f0, hint_y - hint_height / 2, game.cfg.world.width, hint_height)]
+    nothing
+end
+
+function restore!(game::Game, snap::Game)
+    game.rng = deepcopy(snap.rng)
+    game.paddle = deepcopy(snap.paddle)
+    game.balls = deepcopy(snap.balls)
+    game.level = deepcopy(snap.level)
+    game.powerups = deepcopy(snap.powerups)
+    game.fx = deepcopy(snap.fx)
+    game.combo = deepcopy(snap.combo)
+    game.score = snap.score
+    game.lives = snap.lives
+    game.paused = snap.paused
+    nothing
+end
+
+function with_snapshot(f::Function, game::Game, view::View)
+    snap = deepcopy(game)
+    try
+        f()
+    catch err
+        @warn "warmup! failed" exception = (err, catch_backtrace())
+    finally
+        restore!(game, snap)
+        sync_view!(view, game)
+    end
+    nothing
+end
+
+function warmup!(scene, game::Game, view::View)
+    with_snapshot(game, view) do
+        dt, r = game.cfg.world.fixed_dt, ball_radius(game.cfg)
+        warm_step!() = (step_game!(game, scene, dt); sync_view!(view, game); yield())
+        move_paddle!(game, 1f0, dt)
+        sync_view!(view, game)
+        yield()
+        game.balls.launched = false
+        warm_step!()
+        game.balls.launched = true
+        warm_step!()
+        game.balls.main.pos = P2(game.paddle.x + game.paddle.w / 2, game.paddle.y + game.paddle.h + r + 2f0)
+        game.balls.main.vel = V2(0f0, -260f0)
+        warm_step!()
+        if !isempty(game.level.bricks)
+            x1, y1, x2, _ = rect_bounds(game.level.bricks[1].rect)
+            game.balls.main.pos = P2((x1 + x2) / 2, y1 - r - 1f0)
+            game.balls.main.vel = V2(0f0, 300f0)
+            warm_step!()
+        end
+        activate_powerup!(game, Pierce)
+        activate_powerup!(game, Multiball)
+        activate_powerup!(game, Laser)
+        push!(game.powerups.items, PowerupItem(P2(game.paddle.x + game.paddle.w / 2, game.paddle.y + game.paddle.h / 2), V2(0f0, 0f0), Pierce))
+        warm_step!()
+    end
+    nothing
+end
+
+function create_view!(fig, ax, game::Game)
+    cfg = game.cfg
+    view = View(
+        Observable(Rect2[]),
+        Observable(RGBAf[]),
+        Observable(paddle_rect(game)),
+        Observable(Point2f[]),
+        Observable(RGBAf[]),
+        Observable(Point2f[]),
+        Observable(RGBAf[]),
+        Observable(Point2f[]),
+        Observable(RGBAf[]),
+        Observable(Point2f[]),
+        Observable(Point2f[]),
+        Observable(RGBAf[]),
+        Observable(""),
+        Observable(""),
+        Observable(""),
+        Observable(""),
+        Observable(""),
+        Observable(""),
+        Observable(RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)),
+        Observable(Rect2[]),
+        Observable(""),
+    )
+    sync_view!(view, game)
+
+    poly!(ax, view.bricks; color=view.brick_colors, strokecolor=:transparent)
+    scatter!(ax, view.items; marker=:rect, markersize=cfg.powerup.item_marker_size_at_800 * scale_x(cfg), color=view.item_colors)
+    scatter!(ax, view.shots; marker=:circle, markersize=8f0 * scale_x(cfg), color=COLOR_LASER_SHOT)
+    scatter!(ax, view.particles; marker=:circle, markersize=6f0 * scale_x(cfg), color=view.particle_colors)
+    scatter!(ax, view.trail_points; marker=:circle, markersize=2f0 * ball_radius(cfg), color=view.trail_colors)
+    poly!(ax, view.paddle; color=COLOR_PADDLE, strokecolor=:transparent)
+    scatter!(ax, view.balls; marker=:circle, markersize=2f0 * ball_radius(cfg), color=view.ball_colors)
+
+    hud = rectf(0f0, cfg.world.height - 36f0 * scale_y(cfg), cfg.world.width, 36f0 * scale_y(cfg))
+    poly!(ax, hud; color=COLOR_HUDBG, strokecolor=:transparent)
+    text!(ax, view.score_text; position=P2(10f0, cfg.world.height - 4f0), align=(:left, :top), color=COLOR_TEXT, fontsize=20)
+    text!(ax, view.lives_text; position=P2(cfg.world.width / 2, cfg.world.height - 4f0), align=(:center, :top), color=COLOR_TEXT, fontsize=20)
+    text!(ax, view.level_text; position=P2(cfg.world.width - 10f0, cfg.world.height - 4f0), align=(:right, :top), color=COLOR_TEXT, fontsize=20)
+    text!(ax, view.pierce_text; position=P2(cfg.world.width * 0.12f0, cfg.world.height - 4f0), align=(:left, :top), color=COLOR_PU_PIERCE, fontsize=16)
+    text!(ax, view.laser_text; position=P2(cfg.world.width * 0.28f0, cfg.world.height - 4f0), align=(:left, :top), color=COLOR_PU_LASER, fontsize=16)
+    text!(ax, view.combo_text; position=P2(cfg.world.width * 0.72f0, cfg.world.height - 4f0), align=(:center, :top), color=view.combo_color, fontsize=20)
+    poly!(ax, view.hint_bg; color=COLOR_HUDBG, strokecolor=:transparent)
+    text!(ax, view.hint_text; position=P2(cfg.world.width / 2, cfg.world.height * 0.5f0), align=(:center, :center), color=COLOR_TEXT, fontsize=HINT_FONT_SIZE)
+    return view
 end
 
 function breakout()
-    fig = Figure(size=(Int(W), Int(H)), backgroundcolor=COLOR_BG)
-    ax = Axis(fig[1, 1]; limits=((0f0, W), (0f0, H)), aspect=DataAspect(),
-        backgroundcolor=COLOR_BG,
-        xticksvisible=false, yticksvisible=false,
-        xgridvisible=false, ygridvisible=false, xlabelvisible=false, ylabelvisible=false, titlevisible=false)
+    cfg = GameConfig()
+    game = new_game(cfg)
+    fig = Figure(size=(Int(cfg.world.width), Int(cfg.world.height)), backgroundcolor=COLOR_BG)
+    ax = Axis(fig[1, 1]; limits=((0f0, cfg.world.width), (0f0, cfg.world.height)),
+        aspect=DataAspect(), backgroundcolor=COLOR_BG,
+        xticksvisible=false, yticksvisible=false, xgridvisible=false, ygridvisible=false,
+        xlabelvisible=false, ylabelvisible=false, titlevisible=false)
     hidedecorations!(ax)
-
-    # state
-    # unified scaling factors
-    sw                 = W / 800f0
-    sh                 = H / 600f0
-    paddle_w, paddle_h = 100f0 * sw, 14f0 * sw
-    paddle_y           = 40f0 * sh
-    paddle_x           = Observable(W / 2 - paddle_w / 2)
-    paddle_speed       = 480f0 * sw
-
-    # Scale ball size with screen width; 800px width uses the current baseline (8px radius)
-    ball_r      = 8f0 * (W / 800f0)
-    ball_center = Observable(P2(W / 2, H * 0.3f0))  # will be reset onto paddle before the first frame
-    ball_vel    = Ref(V2(176f0, 264f0))
-    launched    = Observable(false)
-    paused      = Observable(false)
-    lives       = Observable(3)
-    score       = Observable(0)
-    level       = Observable(1)
-
-    # level data
-    bricks_obs      = Observable(Vector{GeometryBasics.Rect{2,Float32}}())
-    brick_hp_obs    = Observable(Int[])
-    brick_color_obs = Observable(RGBAf[])
-    begin
-        b, hps, cols = make_level_data_rand(level[])
-        bricks_obs[] = b
-        brick_hp_obs[] = hps
-        brick_color_obs[] = cols
-    end
-
-    # base colors & fx state
-    brick_base_colors_obs = Observable(copy(brick_color_obs[]))
-    fx = FXState(Point2f[], Vec2f[], Float32[], Float32[], RGBAf[], fill(0f0, length(bricks_obs[])))
-
-    # power‑up runtime & visuals
-    pu = PUState(Point2f[], Vec2f[], Symbol[], Point2f[], Vec2f[], Float32[], Point2f[], Vec2f[], Float32[], 0f0, 0f0, 0f0, DROP_BUDGET)
-
-    items_pos_obs = Observable(Point2f[])
-    items_col_obs = Observable(RGBAf[])
-    shots_pos_obs = Observable(Point2f[])
-    extras_pos_obs = Observable(Point2f[])
-    ball_colors_obs = Observable(RGBAf[])
-
-    # draw order: bricks → items/shots → particles/trail → paddle/balls → HUD
-    poly!(ax, bricks_obs; color=brick_color_obs, strokecolor=COLOR_STROKE, strokewidth=0.8 * (W / 800f0))
-
-    # Power‑up item visual size (keep consistent with pickup computation)
-    items_marker_size = 14f0 * (W / 800f0)
-    shots_marker_size = 8f0 * (W / 800f0)
-    scatter!(ax, items_pos_obs; marker=:rect, markersize=items_marker_size, color=items_col_obs)
-    scatter!(ax, shots_pos_obs; marker=:circle, markersize=shots_marker_size, color=COLOR_LASER_SHOT)
-
-    part_pos_obs = Observable(Point2f[])
-    part_col_obs = Observable(RGBAf[])
-    scatter!(ax, part_pos_obs; marker=:circle, markersize=6 * (W / 800f0), color=part_col_obs)
-
-    trail_pts  = Observable(Point2f[])
-    trail_cols = Observable(RGBAf[])
-    scatter!(ax, trail_pts; marker=:circle, markersize=2 * ball_r, color=trail_cols)
-
-    paddle_rect = lift(x -> rectf(x, paddle_y, paddle_w, paddle_h), paddle_x)
-    poly!(ax, paddle_rect; color=COLOR_PADDLE, strokecolor=:transparent)
-
-    # balls (main + extras) — ensure Vector{Point2f}
-    ball_points = lift((c, extras) -> vcat([c], extras), ball_center, extras_pos_obs)
-    ball_colors_obs[] = [COLOR_BALL]
-    scatter!(ax, ball_points; marker=:circle, markersize=2 * ball_r, color=ball_colors_obs)
-
-    # HUD bar
-    hud_rect = rectf(0f0, H - 36f0 * (H / 600f0), W, 36f0 * (H / 600f0))
-    poly!(ax, hud_rect; color=COLOR_HUDBG, strokecolor=:transparent)
-
-    # texts
-    text!(ax, lift(s -> "Score: $s", score); position=P2(10, H - 4), align=(:left, :top), color=COLOR_TEXT, fontsize=20)
-    text!(ax, lift(l -> "Lives: $l", lives); position=P2(W / 2, H - 4), align=(:center, :top), color=COLOR_TEXT, fontsize=20)
-    text!(ax, lift(lv -> "Level: $lv", level); position=P2(W - 10, H - 4), align=(:right, :top), color=COLOR_TEXT, fontsize=20)
-
-    # status text for active timers (minimal)
-    pierce_txt = Observable("")
-    laser_txt  = Observable("")
-    text!(ax, pierce_txt; position=P2(W * 0.12f0, H - 4), align=(:left, :top), color=COLOR_PU_PIERCE, fontsize=16)
-    text!(ax, laser_txt; position=P2(W * 0.28f0, H - 4), align=(:left, :top), color=COLOR_PU_LASER, fontsize=16)
-
-    combo_count = Observable(0)
-    combo_timer = Observable(0f0)
-    combo_text  = Observable("")
-    combo_color = Observable(RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0))
-    text!(ax, combo_text; position=P2(W * 0.72f0, H - 4), align=(:center, :top), color=combo_color, fontsize=20)
-
-    hint = lift(launched) do L
-        L ? "" : "Press SPACE to launch  |  ←/→ Move  |  P Pause\n[  /  ] : Prev / Next Level\n(If keys don't work, click window to focus)"
-    end
-    text!(ax, hint; position=P2(W / 2, H * 0.5), align=(:center, :center), color=COLOR_TEXT, fontsize=18)
+    view = create_view!(fig, ax, game)
 
     display(fig)
     scene = ax.scene
+    warmup!(scene, game, view)
 
-    # Ensure the ball starts on the paddle before the first frame
-    reset_ball!(ball_center, ball_vel, launched, paddle_x[], paddle_w, paddle_y, paddle_h, ball_r, trail_pts, trail_cols)
-
-    # keyboard: level select and reset
-    set_level! = function (L::Int)
-        L2 = clamp(L, 1, 5)
-        level[] = L2
-        b, hps, cols = make_level_data_rand(level[])
-        bricks_obs[] = b
-        brick_hp_obs[] = hps
-        brick_color_obs[] = cols
-        brick_base_colors_obs[] = copy(cols)
-        fx.bflash = fill(0f0, length(b))
-        empty!(fx.ppos)
-        empty!(fx.pvel)
-        empty!(fx.pttl)
-        empty!(fx.ptmax)
-        empty!(fx.pcol)
-        pu.item_pos = Point2f[]
-        pu.item_vel = Vec2f[]
-        pu.item_typ = Symbol[]
-        pu.ball_pos = Point2f[]
-        pu.ball_vel = Vec2f[]
-        pu.ball_ttl = Float32[]
-        pu.shot_pos = Point2f[]
-        pu.shot_vel = Vec2f[]
-        pu.shot_ttl = Float32[]
-        pu.pierce_ttl = 0f0
-        pu.laser_ttl = 0f0
-        pu.next_shot = 0f0
-        pu.drops_left = DROP_BUDGET
-        part_pos_obs[] = Point2f[]
-        part_col_obs[] = RGBAf[]
-        items_pos_obs[] = Point2f[]
-        items_col_obs[] = RGBAf[]
-        shots_pos_obs[] = Point2f[]
-        extras_pos_obs[] = Point2f[]
-        combo_count[] = 0
-        combo_timer[] = 0f0
-        combo_text[] = ""
-        combo_color[] = RGBAf(COLOR_TEXT.r, COLOR_TEXT.g, COLOR_TEXT.b, 0f0)
-        reset_ball!(ball_center, ball_vel, launched, paddle_x[], paddle_w, paddle_y, paddle_h, ball_r, trail_pts, trail_cols)
+    on(events(scene).keyboardbutton) do event
+        if event.action == Keyboard.press
+            event.key == Keyboard.space && (game.balls.launched = true)
+            event.key == Keyboard.p && (game.paused = !game.paused)
+            event.key == Keyboard.left_bracket && set_level!(game, game.level.index - 1)
+            event.key == Keyboard.right_bracket && set_level!(game, game.level.index + 1)
+            event.key == Keyboard.r && reset_run!(game)
+            event.key == Keyboard.escape && close(fig)
+            sync_view!(view, game)
+        end
         nothing
     end
 
-    on(events(scene).keyboardbutton) do e
-        if e.action == Keyboard.press
-            e.key == Keyboard.space && (launched[] = true)
-            e.key == Keyboard.p && (paused[] = !paused[])
-            e.key == Keyboard.left_bracket && set_level!(level[] - 1)
-            e.key == Keyboard.right_bracket && set_level!(level[] + 1)
-            if e.key == Keyboard.r
-                (lives[] = 3; score[] = 0; set_level!(1))
-            end
-            e.key == Keyboard.escape && close(fig)
-        end
-        return
-    end
-
-    # main fixed‑step loop
-    prev_t = time()
-    acc = 0.0
-    @async begin
-        while isopen(scene)
-            now = time()
-            acc += now - prev_t
-            prev_t = now
-            while acc ≥ FIXED_DT
-                if !paused[]
-                    try
-                        update!(scene, FIXED_DT, ball_center, ball_vel, ball_r,
-                            paddle_x, paddle_y, paddle_w, paddle_h, paddle_speed,
-                            launched, bricks_obs, brick_hp_obs, brick_color_obs,
-                            score, lives, trail_pts, trail_cols,
-                            part_pos_obs, part_col_obs, fx, brick_base_colors_obs,
-                            combo_count, combo_timer, combo_text, combo_color, level,
-                            pu, items_pos_obs, items_col_obs, shots_pos_obs, extras_pos_obs, ball_colors_obs, pierce_txt, laser_txt)
-                    catch err
-                        @error "update! crashed" exception = (err, catch_backtrace())
-                        paused[] = true
-                    end
+    previous = time()
+    accumulator = 0.0
+    @async while isopen(scene)
+        now = time()
+        accumulator += now - previous
+        previous = now
+        while accumulator >= cfg.world.fixed_dt
+            if !game.paused
+                try
+                    step_game!(game, scene, cfg.world.fixed_dt)
+                    sync_view!(view, game)
+                catch err
+                    @error "step_game! crashed" exception=(err, catch_backtrace())
+                    game.paused = true
                 end
-                acc -= FIXED_DT
             end
-            sleep(0.001)
+            accumulator -= cfg.world.fixed_dt
         end
+        sleep(0.001)
     end
-
-    fig
+    return fig
 end
 
 breakout()
